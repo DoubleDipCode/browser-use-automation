@@ -20,7 +20,9 @@ from api.models import (
     TaskStatus,
     TaskListResponse,
     HealthResponse,
+    QueueStatus,
 )
+from api.task_queue import task_queue
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -38,10 +40,16 @@ async def lifespan(app: FastAPI):
     await init_database()
     logger.info("Database initialized")
 
+    # Start task queue worker
+    await task_queue.start()
+    logger.info("Task queue worker started")
+
     yield
 
     # Shutdown
     logger.info("Shutting down Browser-Use API Server...")
+    await task_queue.stop()
+    logger.info("Task queue worker stopped")
 
 
 # Create FastAPI app
@@ -63,7 +71,7 @@ async def health_check():
         "api": "healthy",
         "chrome_cdp": "unknown",
         "database": "unknown",
-        "queue_size": 0,
+        "queue_size": task_queue.get_queue_size(),
     }
 
     # Check Chrome CDP
@@ -144,13 +152,14 @@ async def create_task(request: TaskRequest):
 
     logger.info(f"Created task {task_id}: {request.task_description[:50]}...")
 
-    # Note: In Phase 3, we'll add the task to the queue here
-    # For now, just return the task response
+    # Add task to queue for background execution
+    await task_queue.add_task(task_id)
+    queue_position = task_queue.get_queue_size()
 
     return TaskResponse(
         task_id=task_data["task_id"],
         status=task_data["status"],
-        queue_position=None,  # Will be implemented in Phase 3
+        queue_position=queue_position,
         created_at=task_data["created_at"]
     )
 
@@ -232,6 +241,72 @@ async def list_tasks(
         limit=limit,
         offset=offset
     )
+
+
+@app.get(
+    "/queue",
+    response_model=QueueStatus,
+    dependencies=[Depends(validate_api_key)]
+)
+async def get_queue_status():
+    """
+    Get current queue status.
+
+    Returns information about queued tasks and current execution.
+    """
+    queue_length = task_queue.get_queue_size()
+    current_task = task_queue.get_current_task()
+
+    # Calculate estimated completion (simplified - assumes 2 min per task)
+    estimated_completion = None
+    if current_task or queue_length > 0:
+        # This is a rough estimate - in production you'd track actual task durations
+        minutes_remaining = queue_length * 2
+        from datetime import timedelta
+        estimated_completion = datetime.utcnow() + timedelta(minutes=minutes_remaining)
+
+    return QueueStatus(
+        queue_length=queue_length,
+        current_task=current_task,
+        estimated_completion=estimated_completion
+    )
+
+
+@app.delete(
+    "/tasks/{task_id}",
+    dependencies=[Depends(validate_api_key)]
+)
+async def cancel_task(task_id: str):
+    """
+    Cancel a queued task.
+
+    Can only cancel tasks that are in 'queued' status.
+    Running tasks cannot be cancelled.
+    """
+    # Get task from database
+    task = await db.get_task(task_id)
+
+    if not task:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Task {task_id} not found"
+        )
+
+    # Can only cancel queued tasks
+    if task["status"] != "queued":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot cancel task with status '{task['status']}'. Only 'queued' tasks can be cancelled."
+        )
+
+    # Delete from database
+    await db.delete_task(task_id)
+    logger.info(f"Task {task_id} cancelled and removed from database")
+
+    return {
+        "message": f"Task {task_id} cancelled successfully",
+        "task_id": task_id
+    }
 
 
 if __name__ == "__main__":
