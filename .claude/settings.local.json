@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pkill:*)",
+      "Bash(source /Users/antonadmin/browser-use-env/bin/activate)",
+      "Bash(pip install:*)"
+    ]
+  }
+}
